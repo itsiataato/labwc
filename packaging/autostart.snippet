@@ -1,0 +1,5 @@
+# Append to ~/.config/labwc/autostart to auto-start the TopBar + WiFi:
+if [ -x /path/to/labwc-fork/panel/monopanel ]; then
+    pkill -x monopanel 2>/dev/null || true
+    /path/to/labwc-fork/panel/monopanel >/dev/null 2>&1 &
+fi
