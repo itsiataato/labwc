@@ -1,0 +1,6 @@
+# monopanel config — copy to ~/.config/monowl/panel.conf, all keys optional
+height=28
+interface=wlan0
+font=monospace 10
+clock_format=%a %d %b %H:%M
+menu_lines=12

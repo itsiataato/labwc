@@ -1,0 +1,292 @@
+#!/usr/bin/env bash
+# notification — CLI for the monopanel notification queue.
+# Queue: $XDG_DATA_HOME/monowl/notifications/ (*.txt plain + *.q question
+# files, FIFO, oldest-first).
+# The bar shows ONE notification icon top-right: blank/dim when the queue
+# is empty, otherwise a count of TOTAL waiting (plain + questions). No
+# message text appears on the bar. Clicking the icon opens a tiny preview
+# popup (up to 3 oldest plain rows + 1 question row); clicking a plain
+# row dismisses that message, clicking the question row opens the answer
+# deck. The preview closes on selection, empty queue, leave, or Esc.
+# This script is the only writer agents need.
+#
+#   notification send "build done"      # one message (args joined)
+#   echo "hi" | notification send       # stdin when no args
+#   notification list                   # oldest-first: INDEX ID TEXT
+#   notification delete 1               # by index (1 = oldest)
+#   notification delete <id-prefix>     # or by id from list
+#   notification deleteall              # clear queue
+set -euo pipefail
+
+DIR="${XDG_DATA_HOME:-$HOME/.local/share}/monowl/notifications"
+mkdir -p "$DIR"
+
+usage() {
+	# $1 = exit code (default 1). Errors go to stderr; --help calls
+	# print_help directly so it lands on stdout with exit 0.
+	print_help >&2
+	exit "${1:-1}"
+}
+
+print_help() {
+	cat <<'EOF'
+usage: notification <command> [args]
+
+Panel notification queue. The bar shows ONE notification icon
+top-right: blank/dim when the queue is empty, otherwise a count of
+TOTAL waiting (plain messages + questions). No message text appears
+on the bar. Clicking the icon opens a tiny preview popup with up to
+3 oldest plain rows plus 1 question row; clicking a plain row
+dismisses that message, clicking the question row opens the answer
+deck. The preview closes on selection, empty queue, pointer-leave,
+or Esc.
+
+commands:
+  send <text>          queue one message (args are joined with spaces)
+  send                 read the message from stdin when no args given
+  question [--timeout N] [yesorno|answers] "{Q}" ["{A1}" ...]
+                       ask a question; blocks until answered, prints the
+                       answer to stdout and exits 0 (yesorno prints
+                       Yes/No and exits 0/1). answers takes 1-10 custom
+                       answers, each capped at 160 chars. yesorno takes
+                       no custom answers. question text is capped at
+                       512 bytes. --timeout N bounds the wait in seconds
+                       (0, the default, waits forever). exit 2 on timeout,
+                       dismiss, interrupt.
+  list                 show queue oldest-first as: INDEX ID TEXT
+                       (questions show [yes/no?] or [answers N])
+  delete <index|id>    remove by list index (1 = oldest) or id prefix
+  deleteall            clear the whole queue
+  --help, -h, help     show this help
+
+examples:
+  notification send "build done"
+  echo "tests green" | notification send
+  if notification question "ship it?"; then echo "user said Yes"; fi
+  notification question yesorno "ship it?"
+  notification question answers "pick one" "red" "green" "blue"
+  notification question --timeout 60 "still there?"
+  notification question --timeout 30 answers "pick one" "a" "b"
+  notification list
+  notification delete 1
+  notification deleteall
+
+exit codes (question): 0 = Yes/answered, 1 = No (yesorno only),
+  2 = timeout, dismiss, or interrupt.
+queue files: $XDG_DATA_HOME/monowl/notifications/ (~/.local/share/...)
+  plain messages are .txt; questions are .q (line 1 = question text,
+  lines 2+ = custom answers, one per line; 1 line = classic Yes/No).
+EOF
+}
+
+# Sorted oldest-first basenames (.txt plain, .q question; .answer files
+# are rendezvous, never listed).
+sorted() {
+	# WHY nullglob: empty queue lists nothing instead of the pattern.
+	shopt -s nullglob
+	files=("$DIR"/*.txt "$DIR"/*.q)
+	shopt -u nullglob
+	[ "${#files[@]}" -eq 0 ] && return 0
+	printf '%s\n' "${files[@]}" | sort | while IFS= read -r f; do
+		printf '%s\n' "$(basename "$f")"
+	done
+}
+
+[ $# -eq 0 ] && usage 1
+cmd="$1"
+
+case "$cmd" in
+send)
+	shift || true
+	msg="$*"
+	if [ -z "$msg" ] && [ ! -t 0 ]; then
+		msg="$(cat)"
+	fi
+	# Single-line, capped: preview rows display first 160 chars anyway.
+	msg="$(printf '%s' "$msg" | tr '\n' ' ' | sed 's/^ *//;s/ *$//')"
+	[ -n "$msg" ] || { echo "notification: empty message (try: notification send \"done\")" >&2; exit 1; }
+	msg="$(printf '%.512s' "$msg")"
+	name="$(date +%s%N)-$$-$RANDOM"
+	tmp="$DIR/.$name.tmp"
+	printf '%s\n' "$msg" > "$tmp"
+	mv "$tmp" "$DIR/$name.txt"
+	;;
+list)
+	[ $# -eq 1 ] || { echo "notification: list takes no arguments" >&2; usage 1; }
+	i=0
+	while IFS= read -r b; do
+		i=$((i + 1))
+		id="${b%.*}"
+		text="$(head -n1 "$DIR/$b" 2>/dev/null | tr -d '\n' || true)"
+		case "$b" in
+		*.q)
+			# WHY line count: 1-line .q = classic Yes/No, N extra
+			# lines = N custom answers (contract: lines2+).
+			n="$(wc -l < "$DIR/$b" 2>/dev/null | tr -d ' ' || true)"
+			if [ "${n:-1}" -gt 1 ] 2>/dev/null; then
+				text="$text [answers $((n - 1))]"
+			else
+				text="$text [yes/no?]"
+			fi
+			;;
+		esac
+		printf '%d %s %s\n' "$i" "$id" "$text"
+	done < <(sorted)
+	;;
+delete)
+	[ $# -eq 2 ] || { echo "notification: delete needs one <index|id>" >&2; usage 1; }
+	target="$2"
+	# WHY slash reject: the id-prefix glob below would otherwise let
+	# "$target" escape the queue dir (e.g. ../foo).
+	if [[ "$target" == *[/]* ]]; then
+		echo "notification: no id '$target'" >&2
+		exit 1
+	fi
+	# WHY index-first with range check: ids start with epoch digits, so a
+	# bare numeric prefix would otherwise misroute into index lookup.
+	# In-range numbers are indexes; anything else falls to id-prefix.
+	if [[ "$target" =~ ^[0-9]+$ ]]; then
+		total=$(sorted | wc -l)
+		if [ "$target" -ge 1 ] && [ "$target" -le "$total" ]; then
+			b="$(sorted | sed -n "${target}p")"
+			rm -f "$DIR/$b"
+			# WHY quiet sibling wipe: a deleted question must not
+			# leave its .answer rendezvous littering the queue;
+			# >/dev/null silences the trash wrapper (stdout here
+			# is not captured, but keep delete output stable).
+			rm -f "$DIR/${b%.*}.answer" >/dev/null 2>&1
+			exit 0
+		fi
+	fi
+	shopt -s nullglob
+	# WHY prefix star: without it this word has no unquoted metachar
+	# and bash keeps it literal, so every prefix lookup fell through
+	# to "ambiguous id"; the star makes it the documented prefix glob
+	# (the slash guard above keeps it inside the queue dir).
+	matches=( "$DIR/$target"*.txt "$DIR/$target"*.q )
+	shopt -u nullglob
+	[ "${#matches[@]}" -gt 0 ] || { echo "notification: no id '$target'" >&2; exit 1; }
+	[ "${#matches[@]}" -eq 1 ] || { echo "notification: ambiguous id '$target'" >&2; exit 1; }
+	rm -f "${matches[0]}"
+	rm -f "${matches[0]%.*}.answer" >/dev/null 2>&1
+	;;
+deleteall)
+	[ $# -eq 1 ] || { echo "notification: deleteall takes no arguments" >&2; usage 1; }
+	shopt -s nullglob
+	files=("$DIR"/*.txt "$DIR"/*.q "$DIR"/*.answer)
+	shopt -u nullglob
+	[ "${#files[@]}" -gt 0 ] && rm -f "${files[@]}" >/dev/null 2>&1
+	exit 0
+	;;
+question)
+	# WHY blocking rendezvous via <id>.answer: agents get a real answer
+	# (stdout + exit 0/1) with zero new daemons; the panel writes the
+	# answer file on click and this loop picks it up within 0.5s.
+	# *.q line 1 = question text, lines 2+ = custom answers (1-10);
+	# a 1-line .q is the classic Yes/No.
+	shift
+	timeout=0
+	if [ "${1:-}" = "--timeout" ]; then
+		[ $# -ge 2 ] || { echo "notification: --timeout needs seconds" >&2; exit 1; }
+		timeout="$2"
+		[[ "$timeout" =~ ^[0-9]+$ ]] || { echo "notification: --timeout needs seconds" >&2; exit 1; }
+		shift 2
+	fi
+	# WHY quiet wipe: this machine's rm is a trash wrapper that chats on
+	# stdout; question's stdout must stay exactly the answer for $(...) use.
+	wipe() { rm -f "$@" >/dev/null 2>&1; }
+	qtype="yesorno"
+	type_given=0
+	if [ "${1:-}" = "yesorno" ] || [ "${1:-}" = "answers" ]; then
+		qtype="$1"
+		type_given=1
+		shift
+	fi
+	qtext=""
+	answers=()
+	if [ "$qtype" = "answers" ]; then
+		# $1 is the question, the rest are the 1-10 custom answers.
+		[ $# -ge 1 ] || { echo "notification: answers type needs 1-10 answers" >&2; exit 1; }
+		qtext="$1"
+		shift
+		[ $# -ge 1 ] && [ $# -le 10 ] || { echo "notification: answers type needs 1-10 answers" >&2; exit 1; }
+		for a in "$@"; do
+			a="$(printf '%s' "$a" | tr '\n' ' ' | sed 's/^ *//;s/ *$//')"
+			[ -n "$a" ] || { echo "notification: empty answer (answers must be non-empty)" >&2; exit 1; }
+			a="$(printf '%.160s' "$a")"
+			answers+=("$a")
+		done
+	elif [ "$type_given" -eq 1 ]; then
+		[ $# -ge 1 ] || { echo "notification: empty question" >&2; exit 1; }
+		qtext="$1"
+		shift
+		[ $# -eq 0 ] || { echo "notification: yesorno takes no answers (use answers type for custom answers)" >&2; exit 1; }
+	else
+		msg="$*"
+		if [ -z "$msg" ] && [ ! -t 0 ]; then
+			msg="$(cat)"
+		fi
+		qtext="$msg"
+	fi
+	qtext="$(printf '%s' "$qtext" | tr '\n' ' ' | sed 's/^ *//;s/ *$//')"
+	[ -n "$qtext" ] || { echo "notification: empty question" >&2; exit 1; }
+	qtext="$(printf '%.512s' "$qtext")"
+	id="$(date +%s%N)-$$-$RANDOM"
+	tmp="$DIR/.$id.tmp"
+	printf '%s\n' "$qtext" > "$tmp"
+	if [ "${#answers[@]}" -gt 0 ]; then
+		for a in "${answers[@]}"; do
+			printf '%s\n' "$a" >> "$tmp"
+		done
+	fi
+	mv "$tmp" "$DIR/$id.q"
+	cleanup() { wipe "$DIR/$id.q" "$DIR/$id.answer"; }
+	# WHY exit 2 on interrupt: contract exit codes are 0 answered,
+	# 1 No (yesorno only), 2 timeout/dismiss/interrupt.
+	trap 'cleanup; echo "notification: interrupted" >&2; exit 2' INT TERM
+	if ! pgrep -x monopanel >/dev/null 2>&1; then
+		echo "notification: panel not running, nobody can answer" >&2
+	fi
+	pos="$(sorted | grep -F -n -x "$id.q" | cut -d: -f1)"
+	total="$(sorted | wc -l)"
+	if [ "$qtype" = "answers" ]; then
+		echo "notification: question $pos of $total, waiting for answer (${#answers[@]} answers)..." >&2
+	else
+		echo "notification: question $pos of $total, waiting for Yes/No..." >&2
+	fi
+	start=$SECONDS
+	while :; do
+		if [ -f "$DIR/$id.answer" ]; then
+			ans="$(head -n1 "$DIR/$id.answer" 2>/dev/null)"
+			wipe "$DIR/$id.q" "$DIR/$id.answer"
+			trap - INT TERM
+			if [ "$qtype" = "answers" ]; then
+				printf '%s\n' "$ans"
+				exit 0
+			fi
+			case "$ans" in
+			yes|Yes) echo Yes; exit 0 ;;
+			no|No) echo No; exit 1 ;;
+			# WHY verbatim fallback: never misreport an unknown
+			# rendezvous value as No; answered means exit 0.
+			*) printf '%s\n' "$ans"; exit 0 ;;
+			esac
+		fi
+		if [ ! -f "$DIR/$id.q" ]; then
+			wipe "$DIR/$id.answer"
+			trap - INT TERM
+			echo "notification: question dismissed unread" >&2
+			exit 2
+		fi
+		if [ "$timeout" -gt 0 ] && [ $((SECONDS - start)) -ge "$timeout" ]; then
+			wipe "$DIR/$id.q" "$DIR/$id.answer"
+			trap - INT TERM
+			echo "notification: timed out after ${timeout}s" >&2
+			exit 2
+		fi
+		sleep 0.5
+	done
+	;;
+--help|-h|help) print_help; exit 0 ;;
+*) echo "notification: unknown command '$cmd'" >&2; usage 1 ;;
+esac

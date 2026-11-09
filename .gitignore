@@ -7,3 +7,14 @@
 
 # Qt Creator settings
 *.user
+
+# monowl-derived panel build outputs
+panel/monopanel
+panel/monopanel-test
+panel/monopanel-wifi
+panel/notification-gui
+panel/notification-gui-test
+panel/wlr-layer-shell-client.h
+panel/wlr-layer-shell-protocol.c
+panel/xdg-shell-client.h
+panel/xdg-shell-protocol.c

@@ -1,0 +1,189 @@
+.TH NOTIFICATION 1 "October 2026" "monowl" "User Commands"
+.SH NAME
+notification \- send and manage monopanel bar notifications
+.SH SYNOPSIS
+.nf
+\fBnotification send\fR [\fItext\fR]
+\fBnotification question\fR [\fB--timeout\fR \fIN\fR] [\fByesorno\fR|\fBanswers\fR] \fIquestion\fR [\fIanswer\fR ...]
+\fBnotification list\fR
+\fBnotification delete\fR \fIindex-or-id\fR
+\fBnotification deleteall\fR
+\fBnotification --help\fR
+.fi
+.SH DESCRIPTION
+.B notification
+manages the notification queue shown in the monopanel top bar.
+The bar shows ONE notification icon, clock-adjacent (rightmost, left of
+the date), always drawn: a blank/dim pill when the queue is empty, an
+amber count pill showing TOTAL waiting (plain messages plus questions)
+when anything waits. No message text ever renders on the bar.
+.PP
+Clicking the icon (a no-op when the count is zero) opens a tiny
+layer-shell preview popup listing up to 3 oldest plain rows (first
+lines, FIFO) plus at most 1 question row (oldest question). Clicking a
+plain row dismisses that one entry and the count drops; clicking the
+question row spawns
+.B notification-gui ,
+the centered layer-shell answer deck, and closes the preview. The
+preview closes on selection, on an empty queue, on pointer-leave, or on
+Esc.
+.PP
+The answer deck shows one button per answer, oldest question first,
+auto-advancing to the next question and auto-closing when the queue
+drains. Because it is layer-shell and not a client, the deck survives
+Super+D (show-desktop hides clients, never layer surfaces). Esc
+dismisses the current question without answering. Questions are never
+dismissible as plain rows.
+.PP
+The queue is files in
+.IR $XDG_DATA_HOME/monowl/notifications/ ,
+one file per entry, so any process that can write there can post.
+The panel picks up new entries on its 1Hz tick. Plain messages are
+.B .txt
+files; questions are
+.B .q
+files: line 1 is the question text (capped at 512 bytes), lines 2 and
+on carry the custom answers, one per line (1 to 10 lines for the
+.B answers
+type; a single-line file is the classic Yes/No). Answering writes a
+.B .answer
+rendezvous file holding the selected answer text verbatim (lowercase
+"yes"/"no" in the file for the yesorno type, printed capitalized Yes/No
+on stdout); the waiting
+.B question
+caller polls for it every 0.5s.
+.SH COMMANDS
+.TP
+.BI "send " text
+Queue one message. Arguments are joined with spaces; newlines become
+spaces and the text is capped at 512 bytes (preview rows display the
+first 160 characters). With no
+arguments, the message is read from stdin.
+.TP
+.B question [--timeout N] [yesorno|answers] question [answer ...]
+Ask a question and block until it is answered, printing the answer to
+stdout. Three forms:
+.RS
+.IP \(bu 2
+Legacy:
+.B "question \(dqship it?\(dq"
+asks Yes/No (same as spelling out
+.BR yesorno ).
+With no text argument the question is read from stdin.
+.IP \(bu 2
+Explicit Yes/No:
+.B "question yesorno \(dqship it?\(dq"
+takes no answers; extra arguments are an error.
+.IP \(bu 2
+Custom answers:
+.B "question answers \(dqpick one\(dq \(dqred\(dq \(dqgreen\(dq \(dqblue\(dq"
+requires 1 to 10 non-empty answers (fewer or more is an error); each
+answer is capped at 160 characters.
+.RE
+.RS
+.B --timeout
+bounds the wait in seconds (0, the default, waits forever). On timeout, on manual
+.B delete
+of the question, or on interrupt the queue entry is removed and it
+exits 2. Progress and warning notices (waiting-for-answer status,
+\(dqpanel not running\(dq, \(dqtimed out\(dq, \(dqdismissed unread\(dq)
+go to stderr, so stdout stays exactly the
+answer for
+.B $(...)
+use.
+.RE
+.TP
+.B list
+Show the queue oldest-first, one per line, as
+.IR INDEX " ID " TEXT .
+Index 1 is the oldest entry in the queue. Questions carry a
+.B [yes/no?]
+suffix, or
+.BI [answers " N]"
+with the number of custom answers.
+.TP
+.BI "delete " index-or-id
+Remove one entry: by list index (1 = oldest) or by id prefix copied
+from
+.BR list .
+Purely numeric arguments inside the list range are treated as indexes;
+anything else is matched as an id prefix and must match exactly one
+file (either a plain message or a question).
+.TP
+.B deleteall
+Clear the whole queue (plain messages and questions).
+.TP
+.BR --help ", " -h ", " help
+Show usage on stdout and exit 0.
+.PP
+Running
+.B notification
+with no command, or with an unknown command or wrong argument count,
+prints usage to stderr and exits 1.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.B question :
+answered (prints Yes or the chosen answer).
+.TP
+.B 1
+.B question
+with the yesorno type: the answer was No (prints No).
+Also used for usage errors.
+.TP
+.B 2
+.B question :
+timeout, dismiss (deleted unread, or Esc in the GUI), or interrupt.
+.SH EXAMPLES
+.PP
+.nf
+.RS
+notification send "build done"
+echo "tests green" | notification send
+# legacy Yes/No question (exit 0 = Yes, 1 = No):
+if notification question "ship it?"; then echo "user said Yes"; fi
+# explicit Yes/No:
+notification question yesorno "ship it?"
+# custom answers (prints exactly the picked answer):
+notification question answers "pick one" "red" "green" "blue"
+# bounded wait (exit 2 on timeout):
+notification question --timeout 60 "still there?"
+notification question --timeout 30 answers "pick one" "a" "b"
+notification list
+notification delete 1
+notification deleteall
+# Super+D flow: press Super+D to clear to the desktop, then click
+# the notification icon; the preview popup lists the waiting items
+# and its question row opens the answer deck over the desktop
+# (both are layer-shell, not clients).
+.RE
+.fi
+.SH FILES
+.TP
+.I ~/.local/share/monowl/notifications/
+Queue directory (or
+.I $XDG_DATA_HOME/monowl/notifications/
+when set):
+.B .txt
+plain messages,
+.B .q
+questions,
+.B .answer
+answer rendezvous files (never listed).
+.TP
+.I notification-gui
+Answer deck binary, looked up beside the running monopanel binary
+(repo: panel/notification-gui). Accepts
+.B --help
+and
+.B --dry-run
+(list queued questions plus answers without needing a display).
+With
+.B --preview
+it opens the tiny preview popup (up to 3 oldest plain rows + 1
+question row that routes to the deck);
+.B --preview --dry-run
+prints the preview rows without needing a display.
+.SH SEE ALSO
+.BR monopanel (1)
